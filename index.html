@@ -970,6 +970,10 @@
       <h1>Trail Priority Tool</h1>
     </div>
     <div class="stats-row" id="statsRow"></div>
+    <div id="authArea" style="display:flex; align-items:center; gap:10px; margin-left:16px;">
+      <span id="authStatus" style="font-size:12.5px; color:var(--slate);">Viewing public data</span>
+      <button id="signInBtn" style="font-size:12.5px; font-weight:600; padding:6px 12px; border:1px solid var(--forest-dim); border-radius:3px; background:var(--card); color:var(--forest-dim); cursor:pointer; font-family:inherit;">Sign in for full data</button>
+    </div>
   </div>
 </div>
 
@@ -3295,6 +3299,149 @@ loadCoreData().then(initApp).catch(err=>{
       <p style="font-size:13px; color:#888;">Make sure this page is served from a web server (not opened directly as a local file -- browsers block that for security), and that the <code>data/</code> folder with its 4 JSON files sits alongside index.html.</p>
     </div>`;
 });
+
+/* ============================================================================
+   ArcGIS Online sign-in (OAuth 2.0, PKCE flow) -- lets a signed-in org member
+   pull the real, non-redacted trail/project data from secured Hosted Feature
+   Layers, while everyone else sees only the public tiered data already loaded
+   above. No backend server involved -- PKCE is the standard, secure way to do
+   OAuth from a pure static site with no place to keep a client secret.
+
+   === FILL THESE IN ONCE YOU'VE REGISTERED THE APP AND PUBLISHED THE LAYERS ===
+   ============================================================================ */
+const AGOL_CONFIG = {
+  orgUrl: 'https://nps.maps.arcgis.com',
+  clientId: 'uk3SLZ9P2JaADlkh',
+  redirectUri: window.location.origin + window.location.pathname,  // must exactly match a
+                                                                     // Redirect URI registered on the app
+  trailsLayerUrl: 'https://services1.arcgis.com/fBc8EJBxQRMcHlei/arcgis/rest/services/trails_for_agol/FeatureServer/0',
+  projectsLayerUrl: 'https://services1.arcgis.com/fBc8EJBxQRMcHlei/arcgis/rest/services/projects_for_agol/FeatureServer/0',
+};
+
+function base64UrlEncode(buffer){
+  return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+async function sha256(str){
+  const data = new TextEncoder().encode(str);
+  return await crypto.subtle.digest('SHA-256', data);
+}
+function randomString(len=64){
+  const arr = new Uint8Array(len);
+  crypto.getRandomValues(arr);
+  return base64UrlEncode(arr.buffer);
+}
+
+async function signIn(){
+  const verifier = randomString();
+  sessionStorage.setItem('pkce_verifier', verifier);
+  const challenge = base64UrlEncode(await sha256(verifier));
+
+  const params = new URLSearchParams({
+    client_id: AGOL_CONFIG.clientId,
+    response_type: 'code',
+    redirect_uri: AGOL_CONFIG.redirectUri,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    expiration: '20160' // token lifetime in minutes (14 days); adjust to your org's policy
+  });
+  window.location.href = `${AGOL_CONFIG.orgUrl}/sharing/rest/oauth2/authorize?${params.toString()}`;
+}
+
+async function handleAuthRedirect(){
+  const url = new URL(window.location.href);
+  const code = url.searchParams.get('code');
+  if (!code) return null;
+
+  const verifier = sessionStorage.getItem('pkce_verifier');
+  const body = new URLSearchParams({
+    client_id: AGOL_CONFIG.clientId,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: AGOL_CONFIG.redirectUri,
+    code_verifier: verifier
+  });
+  const resp = await fetch(`${AGOL_CONFIG.orgUrl}/sharing/rest/oauth2/token`, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body
+  });
+  const data = await resp.json();
+  if (data.access_token){
+    sessionStorage.setItem('agol_token', data.access_token);
+    // clean the ?code=... out of the URL so refreshing doesn't try to reuse it
+    window.history.replaceState({}, '', AGOL_CONFIG.redirectUri);
+    return data.access_token;
+  }
+  return null;
+}
+
+/* Converts an Esri Feature Layer query response into the same array shape the
+   public JSON files already use, so the rest of the app doesn't need to know
+   or care whether it's looking at public or authenticated data.
+   *** VERIFY FIELD NAMES HERE once the real layer is published -- Esri sometimes
+   *** adjusts field names on publish (truncation, reserved words, etc). ***/
+function esriFeaturesToTrails(json){
+  return (json.features || []).map(f=>{
+    const a = f.attributes;
+    return {
+      ID: a.ID, Location: a.Location, Area: a.Area, County: a.County,
+      CRV: a.CRV, DM_R: a.DM_R, FCI: a.FCI,
+      ClimateScore: a.ClimateScore, ClimateRank: a.ClimateRank,
+      Historic: a.Historic, Ranking: a.Ranking, Qty: a.Qty,
+      Latitude: f.geometry ? f.geometry.y : a.Latitude,
+      Longitude: f.geometry ? f.geometry.x : a.Longitude,
+    };
+  });
+}
+function esriFeaturesToProjects(json){
+  return (json.features || []).map(f=>{
+    const a = f.attributes;
+    return {
+      cid: a.cid, t: a.t, lat: f.geometry ? f.geometry.y : a.lat, lon: f.geometry ? f.geometry.x : a.lon,
+      yr: a.yr, fund: a.fund, req: a.req, fnd: a.fnd, score: a.score, api: a.api,
+      loc: a.loc, crit: a.crit, cstat: a.cstat,
+    };
+  });
+}
+
+async function loadAuthenticatedData(token){
+  document.getElementById('authStatus').textContent = 'Loading full data\u2026';
+  const qParams = new URLSearchParams({ f: 'json', where: '1=1', outFields: '*', returnGeometry: 'true', token });
+  const [trailsResp, projectsResp] = await Promise.all([
+    fetch(`${AGOL_CONFIG.trailsLayerUrl}/query?${qParams.toString()}`),
+    fetch(`${AGOL_CONFIG.projectsLayerUrl}/query?${qParams.toString()}`)
+  ]);
+  const trailsJson = await trailsResp.json();
+  const projectsJson = await projectsResp.json();
+  if (trailsJson.error || projectsJson.error){
+    throw new Error((trailsJson.error && trailsJson.error.message) || (projectsJson.error && projectsJson.error.message) || 'AGOL query failed');
+  }
+
+  DATA = esriFeaturesToTrails(trailsJson);
+  PROJECTS = esriFeaturesToProjects(projectsJson);
+  DATA.forEach(computeHazardsForTrail);
+  _projAggCache = {}; // stale, keyed to the old (redacted) project set
+
+  document.getElementById('authStatus').innerHTML = '<b style="color:var(--forest-dim);">Signed in \u2014 showing full data</b>';
+  document.getElementById('signInBtn').style.display = 'none';
+  render();
+}
+
+document.getElementById('signInBtn').addEventListener('click', signIn);
+
+(async function initAuth(){
+  let token = sessionStorage.getItem('agol_token');
+  if (!token){
+    token = await handleAuthRedirect();
+  }
+  if (token){
+    try{
+      await loadAuthenticatedData(token);
+    } catch(err){
+      sessionStorage.removeItem('agol_token');
+      document.getElementById('authStatus').textContent = 'Sign-in failed: ' + err.message;
+    }
+  }
+})();
 </script>
 </body>
 </html>
